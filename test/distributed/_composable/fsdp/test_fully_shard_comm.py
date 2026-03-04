@@ -47,6 +47,7 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.debug import CommDebugMode
 from torch.distributed.tensor.experimental import implicit_replication
 from torch.testing._internal.common_distributed import (
+    MultiProcContinuousTest,
     PLATFORM_SUPPORTS_SYMM_MEM,
     requires_multicast_support,
     skip_if_lt_x_gpu,
@@ -1682,25 +1683,62 @@ class TestFullyShardAllocFromPG(FSDPTest):
             model.set_allocate_memory_from_process_group_for_comm(True)
 
 
-class TestFullyShardSymmMem(FSDPTest):
+class TestFullyShardSymmMem(MultiProcContinuousTest):
+    @classmethod
+    def backend_str(cls) -> Optional[str]:
+        return "nccl"
+
+    @classmethod
+    def opts(cls) -> Optional[dist.ProcessGroupNCCL.Options]:
+        # Enable Zero-CTA policy for CE collectives
+        opts = dist.ProcessGroupNCCL.Options()
+        opts.config.cta_policy = dist.ProcessGroupNCCL.NCCL_CTA_POLICY_ZERO
+        return opts
+
+    @property
+    def device(self) -> torch.device:
+        return torch.device("cuda", self.rank)
+
+    def get_profiler(self):
+        # Prepare a profiler
+        prof = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=True,
+            with_stack=True,
+            with_modules=True,
+        )
+        return prof
+
     @skip_if_lt_x_gpu(2)
     @unittest.skipIf(not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this platform")
     def test_fully_shard_symm_mem(self):
         torch.manual_seed(42 + self.rank)
         device = torch.device("cuda", self.rank)
+        torch.cuda.set_device(device)
         model_args = ModelArgs()
+        model_args.dim = 4096
         model = Transformer(model_args).to(device)
         for module in model.modules():
             if isinstance(module, TransformerBlock):
                 fully_shard(module)
                 module.set_symm_mem_for_comm(True)
+                module.set_reshard_after_forward(False)
         fully_shard(model)
         model.set_symm_mem_for_comm(True)
+        model.set_reshard_after_forward(False)
 
         inp = torch.randint(0, model_args.vocab_size, (2, 16), device=device)
-        loss = model(inp)
-        loss.sum().backward()
+
+        prof = self.get_profiler()
+        with prof:
+            loss = model(inp)
+            loss.sum().backward()
         torch.cuda.synchronize(device)
+        if self.rank == 0:
+            prof.export_chrome_trace(f"fsdp_symm_mem_trace_rank{self.rank}.json")
 
 
 class TestFullyShardForceSumReduction(FSDPTest):
