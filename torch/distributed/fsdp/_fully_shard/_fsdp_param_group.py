@@ -25,6 +25,7 @@ from ._fsdp_collectives import (
     foreach_reduce,
     ProcessGroupAllocAllGather,
     ProcessGroupAllocReduceScatter,
+    SymmMemAllocAllGather,
     ReduceScatter,
 )
 from ._fsdp_common import (
@@ -281,7 +282,7 @@ class FSDPParamGroup:
                 f"when all gather comm is custom: {self._all_gather_comm.__class__.__name__}"
             )
         self._all_gather_comm = (
-            ProcessGroupAllocAllGather(self._all_gather_process_group)
+            SymmMemAllocAllGather(self._all_gather_process_group)
             if enable
             else DefaultAllGather()
         )

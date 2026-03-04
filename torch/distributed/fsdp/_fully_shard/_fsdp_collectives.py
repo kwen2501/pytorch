@@ -5,6 +5,7 @@ from typing import Any, cast, NamedTuple
 
 import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
 from torch.distributed.device_mesh import _get_device_handle
 from torch.distributed.distributed_c10d import ReduceOp
 from torch.distributed.fsdp._fully_shard._fsdp_api import AllGather, ReduceScatter
@@ -78,6 +79,27 @@ class ProcessGroupAllocMixin:
         return torch.empty(*size, dtype=dtype, device=device)
 
 
+class SymmMemAllocMixin:
+    comm_initialized = False
+
+    def __init__(self, group: dist.ProcessGroup, *args: Any, **kwargs: Any):
+        self._group = group
+        super().__init__(*args, **kwargs)
+        # Force initialization of communicator
+        if not self.comm_initialized:
+            dist.barrier(group=group)
+            self.comm_initialized = True
+
+    def allocate(
+        self,
+        size: Sequence[int | torch.SymInt],
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        return symm_mem.empty(size, dtype=dtype, device=device)
+
+
 class DefaultAllGather(DefaultAllocMixin, AllGather):
     def __call__(
         self,
@@ -105,6 +127,27 @@ class ProcessGroupAllocAllGather(ProcessGroupAllocMixin, AllGather):
         group: dist.ProcessGroup,
         async_op: bool = False,
     ) -> dist.Work | None:
+        return dist.all_gather_into_tensor(
+            output_tensor,
+            input_tensor,
+            group=group,
+            async_op=async_op,
+        )
+
+
+class SymmMemAllocAllGather(SymmMemAllocMixin, AllGather):
+    def __init__(self, group: dist.ProcessGroup) -> None:
+        super().__init__(group)
+
+    def __call__(
+        self,
+        output_tensor: torch.Tensor,
+        input_tensor: torch.Tensor,
+        group: dist.ProcessGroup,
+        async_op: bool = False,
+    ) -> dist.Work | None:
+        symm_mem.rendezvous(input_tensor, group=group.group_name)
+        symm_mem.rendezvous(output_tensor, group=group.group_name)
         return dist.all_gather_into_tensor(
             output_tensor,
             input_tensor,
