@@ -27,7 +27,6 @@ from ._fsdp_collectives import (
     ProcessGroupAllocReduceScatter,
     ReduceScatter,
     SymmMemAllGather,
-    SymmMemReduceScatter,
 )
 from ._fsdp_common import (
     compiled_autograd_enabled,
@@ -282,20 +281,6 @@ class FSDPParamGroup:
             SymmMemAllGather(self._all_gather_process_group)
             if enable
             else DefaultAllGather()
-        )
-
-        if not isinstance(
-            self._reduce_scatter_comm,
-            (DefaultReduceScatter | SymmMemReduceScatter),
-        ):
-            raise AssertionError(
-                "cannot call set_symm_mem() "
-                f"when reduce scatter comm is custom: {self._reduce_scatter_comm.__class__.__name__}"
-            )
-        self._reduce_scatter_comm = (
-            SymmMemReduceScatter(self._reduce_scatter_process_group)
-            if enable
-            else DefaultReduceScatter()
         )
 
     def set_allocate_memory_from_process_group(self, enable: bool) -> None:
