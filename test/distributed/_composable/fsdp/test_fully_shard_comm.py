@@ -12,6 +12,7 @@ from unittest.mock import MagicMock
 
 import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed._composable import checkpoint, replicate
@@ -46,6 +47,7 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.debug import CommDebugMode
 from torch.distributed.tensor.experimental import implicit_replication
 from torch.testing._internal.common_distributed import (
+    PLATFORM_SUPPORTS_SYMM_MEM,
     requires_multicast_support,
     skip_if_lt_x_gpu,
 )
@@ -1678,6 +1680,27 @@ class TestFullyShardAllocFromPG(FSDPTest):
         # setting this after custom comm is used is ko
         with self.assertRaises(AssertionError):
             model.set_allocate_memory_from_process_group_for_comm(True)
+
+
+class TestFullyShardSymmMem(FSDPTest):
+    @skip_if_lt_x_gpu(2)
+    @unittest.skipIf(not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this platform")
+    def test_fully_shard_symm_mem(self):
+        torch.manual_seed(42 + self.rank)
+        device = torch.device("cuda", self.rank)
+        model_args = ModelArgs()
+        model = Transformer(model_args).to(device)
+        for module in model.modules():
+            if isinstance(module, TransformerBlock):
+                fully_shard(module)
+                module.set_symm_mem_for_comm(True)
+        fully_shard(model)
+        model.set_symm_mem_for_comm(True)
+
+        inp = torch.randint(0, model_args.vocab_size, (2, 16), device=device)
+        loss = model(inp)
+        loss.sum().backward()
+        torch.cuda.synchronize(device)
 
 
 class TestFullyShardForceSumReduction(FSDPTest):

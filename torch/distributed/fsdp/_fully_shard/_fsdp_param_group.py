@@ -25,8 +25,9 @@ from ._fsdp_collectives import (
     foreach_reduce,
     ProcessGroupAllocAllGather,
     ProcessGroupAllocReduceScatter,
-    SymmMemAllocAllGather,
     ReduceScatter,
+    SymmMemAllGather,
+    SymmMemReduceScatter,
 )
 from ._fsdp_common import (
     compiled_autograd_enabled,
@@ -269,6 +270,34 @@ class FSDPParamGroup:
         self._init_mp_dtypes()
         self._register_state_dict_hooks()
 
+    def set_symm_mem(self, enable: bool) -> None:
+        if not isinstance(
+            self._all_gather_comm, (DefaultAllGather | SymmMemAllGather)
+        ):
+            raise AssertionError(
+                "cannot call set_symm_mem() "
+                f"when all gather comm is custom: {self._all_gather_comm.__class__.__name__}"
+            )
+        self._all_gather_comm = (
+            SymmMemAllGather(self._all_gather_process_group)
+            if enable
+            else DefaultAllGather()
+        )
+
+        if not isinstance(
+            self._reduce_scatter_comm,
+            (DefaultReduceScatter | SymmMemReduceScatter),
+        ):
+            raise AssertionError(
+                "cannot call set_symm_mem() "
+                f"when reduce scatter comm is custom: {self._reduce_scatter_comm.__class__.__name__}"
+            )
+        self._reduce_scatter_comm = (
+            SymmMemReduceScatter(self._reduce_scatter_process_group)
+            if enable
+            else DefaultReduceScatter()
+        )
+
     def set_allocate_memory_from_process_group(self, enable: bool) -> None:
         """
         Whether to (try to) use the ProcessGroup's allocate_tensor method for
@@ -282,7 +311,7 @@ class FSDPParamGroup:
                 f"when all gather comm is custom: {self._all_gather_comm.__class__.__name__}"
             )
         self._all_gather_comm = (
-            SymmMemAllocAllGather(self._all_gather_process_group)
+            ProcessGroupAllocAllGather(self._all_gather_process_group)
             if enable
             else DefaultAllGather()
         )

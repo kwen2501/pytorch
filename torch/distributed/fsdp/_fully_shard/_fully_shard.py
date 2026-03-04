@@ -596,6 +596,23 @@ class FSDPModule:
         if (fsdp_param_group := state._fsdp_param_group) is not None:
             fsdp_param_group.set_allocate_memory_from_process_group(enable)
 
+    def set_symm_mem_for_comm(self, enable: bool) -> None:
+        """
+        Sets whether to use symmetric memory (``symm_mem``) for allocating the
+        staging buffers used in all-gather and reduce-scatter collectives. This
+        allows NCCL to use NVLink SHARP zero-copy transfers via symmetric
+        memory rendezvous.
+
+        This cannot be used together with :meth:`set_custom_all_gather` or
+        :meth:`set_custom_reduce_scatter`.
+
+        Args:
+            enable (bool): Whether to turn on symmetric memory allocation.
+        """
+        state = self._get_fsdp_state()
+        if (fsdp_param_group := state._fsdp_param_group) is not None:
+            fsdp_param_group.set_symm_mem(enable)
+
     def _set_unshard_async_op(self, async_op: bool):
         """
         Sets whether to use ``async_op=True`` or ``False`` for the pre-forward
