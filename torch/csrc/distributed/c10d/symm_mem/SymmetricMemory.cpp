@@ -554,6 +554,8 @@ TORCH_LIBRARY_FRAGMENT(symm_mem, m) {
   m.def(
       "nccl_reduce_scatter_offset(Tensor input, Tensor(a!)[] out, str group_name, int dim, int[]? offsets=None, int[]? dst_ranks=None, str red_op='sum') -> ()");
   m.def(
+      "nccl_mxn_cast(Tensor(a!) buf, int[] src_local_shape, int[] src_mesh_dims, int src_mesh_start_rank, int[] src_placement, int[] dst_local_shape, int[] dst_mesh_dims, int dst_mesh_start_rank, int[] dst_placement, str group_name) -> ()");
+  m.def(
       "nvshmem_all_to_all(Tensor input, Tensor(a!) out, str group_name) -> Tensor(a!)");
   m.def(
       "all_to_all_vdev(Tensor input, Tensor(a!) out, Tensor in_splits, Tensor(a!) out_splits_offsets, str group_name) -> ()");

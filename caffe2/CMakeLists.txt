@@ -595,8 +595,21 @@ if(USE_CUDA)
         ${TORCH_SRC_DIR}/csrc/distributed/c10d/symm_mem/NCCLSymmetricMemory.cu
         ${TORCH_SRC_DIR}/csrc/distributed/c10d/symm_mem/nccl_extension.cu
         ${TORCH_SRC_DIR}/csrc/distributed/c10d/symm_mem/ops/nccl_reduce_scatter_offset.cu
+        ${TORCH_SRC_DIR}/csrc/distributed/c10d/symm_mem/ops/nccl_mxn_cast.cu
         ${TORCH_SRC_DIR}/csrc/distributed/c10d/symm_mem/cuda_mem_pool.cpp
         PROPERTIES COMPILE_FLAGS "-DPYTORCH_C10_DRIVER_API_SUPPORTED=1"
+      )
+      set_source_files_properties(
+        ${TORCH_SRC_DIR}/csrc/distributed/c10d/symm_mem/ops/nccl_mxn_cast.cu
+        PROPERTIES INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/third_party/nccl-reshard/src"
+      )
+      set_source_files_properties(
+        ${PROJECT_SOURCE_DIR}/third_party/nccl-reshard/src/reshard_3d_tensor.cu
+        ${PROJECT_SOURCE_DIR}/third_party/nccl-reshard/src/staging_buffer.cu
+        ${PROJECT_SOURCE_DIR}/third_party/nccl-reshard/src/staging_reshard_kernel.cu
+        PROPERTIES
+          COMPILE_FLAGS "-DNCCL_RESHARD_NO_MPI -DRESHARD_3D_TENSOR_NO_MAIN -DPYTORCH_C10_DRIVER_API_SUPPORTED=1"
+          INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/third_party/nccl-reshard/src"
       )
     endif()
 

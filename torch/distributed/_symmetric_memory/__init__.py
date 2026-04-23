@@ -2270,6 +2270,177 @@ def reduce_scatter_offset(
         )
 
 
+def _mxn_cast_mesh_to_ints(
+    mesh: "torch.distributed.device_mesh.DeviceMesh",
+) -> tuple[list[int], int]:
+    """Extract ``(mesh_dims, start_rank)`` from a ``DeviceMesh`` as the
+    underlying ``ncclReshard3D`` C API expects them.
+
+    - 1-D meshes are widened to ``(N, 1)`` to match the 2-D mesh shape the
+      C API consumes (mirroring the pybind wrapper in
+      ``third_party/nccl-reshard``).
+    - ``start_rank`` is the minimum rank appearing in the mesh.
+    """
+    mesh_t = mesh.mesh
+    if mesh_t.dim() == 1:
+        dims = [int(mesh_t.size(0)), 1]
+    elif mesh_t.dim() == 2:
+        dims = [int(mesh_t.size(0)), int(mesh_t.size(1))]
+    else:
+        raise ValueError(
+            f"mxn_cast: DeviceMesh must be 1-D or 2-D, got {mesh_t.dim()}-D"
+        )
+    start_rank = int(mesh_t.flatten().min().item())
+    return dims, start_rank
+
+
+def _mxn_cast_placements_to_ints(
+    placements: "list[torch.distributed.tensor.placement_types.Placement]",
+) -> list[int]:
+    """Convert a list of ``Placement`` objects to the two-element int encoding
+    used by the ``ncclReshard3DMesh`` C API:
+
+    - ``Shard(d)`` -> ``d``
+    - ``Replicate()`` -> ``-1``
+
+    Partial placements are not supported.  Lists shorter than 2 are padded
+    with ``-1`` (REPLICATE), matching the pybind helper in
+    ``third_party/nccl-reshard``.
+    """
+    from torch.distributed.tensor.placement_types import Replicate, Shard
+
+    ints: list[int] = [-1, -1]
+    for i, p in enumerate(placements[:2]):
+        if isinstance(p, Shard):
+            ints[i] = int(p.dim)
+        elif isinstance(p, Replicate):
+            ints[i] = -1
+        else:
+            raise ValueError(
+                f"mxn_cast: unsupported placement type {type(p).__name__}; "
+                "only Shard and Replicate are supported"
+            )
+    return ints
+
+
+def _mxn_cast_mesh_contains_rank(
+    mesh: "torch.distributed.device_mesh.DeviceMesh", global_rank: int
+) -> bool:
+    """Return True if ``global_rank`` appears in ``mesh.mesh``."""
+    mesh_t = mesh.mesh
+    return bool((mesh_t.flatten() == global_rank).any().item())
+
+
+def mxn_cast(
+    buf: torch.Tensor,
+    src_local_shape: "list[int] | torch.Size",
+    src_mesh: "torch.distributed.device_mesh.DeviceMesh",
+    src_placements: "list[torch.distributed.tensor.placement_types.Placement]",
+    dst_local_shape: "list[int] | torch.Size",
+    dst_mesh: "torch.distributed.device_mesh.DeviceMesh",
+    dst_placements: "list[torch.distributed.tensor.placement_types.Placement]",
+    group: str,
+) -> None:
+    r"""
+    mxn_cast(buf, src_local_shape, src_mesh, src_placements, dst_local_shape, dst_mesh, dst_placements, group) -> None
+
+    M-to-N cast (resharding) of a 2-D or 3-D tensor between two rank meshes,
+    backed by the ``ncclReshard3D`` primitive from
+    ``third_party/nccl-reshard``.
+
+    The call is collective over ``group``, which must span ``src_mesh`` ∪
+    ``dst_mesh``.  A rank's role is determined by mesh membership:
+
+    - If the rank is in ``src_mesh`` only (source-only), ``buf`` must
+      contain this rank's source shard on entry and is left untouched on
+      return.
+    - If the rank is in ``dst_mesh`` only (destination-only), the contents
+      of ``buf`` on entry are don't-care; on return, the first
+      ``prod(dst_local_shape)`` elements (viewed as ``dst_local_shape``)
+      contain this rank's destination shard.
+    - If the rank is in both meshes (dual role, typical for overlapping
+      meshes), the operator is in-place on ``buf``: the source shard is
+      read, then overwritten with the destination shard.
+
+    In all cases ``buf`` must be allocated via NCCL symmetric memory (e.g.
+    :func:`empty` with the NCCL backend) and must be large enough to hold
+    whichever of ``src_local_shape`` / ``dst_local_shape`` applies to this
+    rank::
+
+        buf.numel() >= max(prod(src_local_shape) if in src_mesh else 0,
+                           prod(dst_local_shape) if in dst_mesh else 0)
+
+    Each mesh is described by a :class:`~torch.distributed.device_mesh.DeviceMesh`
+    (1-D or 2-D; 1-D is widened to ``(N, 1)``) whose ``.mesh`` tensor holds
+    the *global* ranks participating in that mesh.  The ranks in each mesh
+    must be contiguous (the underlying C API uses ``start_rank + size`` to
+    define the range).
+
+    Placements (one entry per mesh dim):
+
+    - ``Shard(dim)`` — the global tensor is sharded along tensor dim ``dim``
+      across that mesh dimension.
+    - ``Replicate()`` — the data is replicated across that mesh dimension.
+
+    Only one mesh dimension may use ``Shard`` at a time (matching the
+    underlying ``ncclReshard3DMesh`` constraints).
+
+    Args:
+        buf (Tensor): NCCL-symmetric-memory-allocated buffer sized for
+            whichever role(s) this rank has (see above).
+        src_local_shape (list[int] or torch.Size): This rank's local shape
+            for the source layout.  Ignored on destination-only ranks.
+        src_mesh (DeviceMesh): Mesh describing the ranks holding the source
+            layout.
+        src_placements (list[Placement]): Placements of the source on
+            ``src_mesh`` (one per mesh dim).
+        dst_local_shape (list[int] or torch.Size): This rank's local shape
+            for the destination layout.  Ignored on source-only ranks.
+        dst_mesh (DeviceMesh): Mesh describing the ranks holding the
+            destination layout.
+        dst_placements (list[Placement]): Placements of the destination on
+            ``dst_mesh`` (one per mesh dim).
+        group (str): Name of the ``ProcessGroup`` spanning all ranks in
+            ``src_mesh`` ∪ ``dst_mesh``.
+    """
+    backend = get_backend(buf.device)
+    if backend != "NCCL":
+        raise NotImplementedError(f"mxn_cast: unsupported backend: {backend}")
+
+    src_mesh_dims, src_start_rank = _mxn_cast_mesh_to_ints(src_mesh)
+    dst_mesh_dims, dst_start_rank = _mxn_cast_mesh_to_ints(dst_mesh)
+    src_placement_ints = _mxn_cast_placements_to_ints(src_placements)
+    dst_placement_ints = _mxn_cast_placements_to_ints(dst_placements)
+
+    # Auto-detect this rank's role from mesh membership.  A zero-filled
+    # local shape signals "not my role" to the C++ wrapper, which passes
+    # nullptr to the underlying ncclReshard3D call for that side.
+    global_rank = torch.distributed.get_rank()
+    in_src = _mxn_cast_mesh_contains_rank(src_mesh, global_rank)
+    in_dst = _mxn_cast_mesh_contains_rank(dst_mesh, global_rank)
+    if not in_src and not in_dst:
+        raise ValueError(
+            f"mxn_cast: rank {global_rank} is in neither src_mesh nor "
+            "dst_mesh; it must be in at least one to participate"
+        )
+
+    src_shape_ints = list(src_local_shape) if in_src else [0] * len(src_local_shape)
+    dst_shape_ints = list(dst_local_shape) if in_dst else [0] * len(dst_local_shape)
+
+    torch.ops.symm_mem.nccl_mxn_cast(
+        buf,
+        src_shape_ints,
+        src_mesh_dims,
+        src_start_rank,
+        src_placement_ints,
+        dst_shape_ints,
+        dst_mesh_dims,
+        dst_start_rank,
+        dst_placement_ints,
+        group,
+    )
+
+
 __all__ = [
     "empty",
     "rendezvous",
@@ -2280,4 +2451,5 @@ __all__ = [
     "get_signal_pad_size",
     "get_mem_pool",
     "reduce_scatter_offset",
+    "mxn_cast",
 ]

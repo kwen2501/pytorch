@@ -581,6 +581,146 @@ class NCCLSymmetricMemoryTest(MultiProcContinuousTest):
 
     @skip_but_pass_in_sandcastle_if(TEST_WITH_ROCM, "Skip NCCL tests for ROCm")
     @skip_but_pass_in_sandcastle_if(IS_WINDOWS, "NCCL doesn't support Windows")
+    @requires_nccl_version((2, 29, 7), "nccl_mxn_cast requires nccl 2.29.7")
+    @skip_if_lt_x_gpu(4)
+    @parametrize("src_shard_dim", [0, 1])
+    @parametrize("dst_shard_dim", [0, 1])
+    def test_mxn_cast_2d_disjoint_meshes(
+        self, src_shard_dim: int, dst_shard_dim: int
+    ):
+        """symm_mem.mxn_cast between two disjoint rank meshes (the canonical
+        producer -> consumer M-to-N cast case).  The first half of WORLD owns
+        the source layout; the second half owns the destination layout.
+        Each rank participates in exactly one mesh, so on return the source
+        ranks leave ``buf`` untouched and the destination ranks see their
+        local shard of the destination layout."""
+        from torch.distributed.device_mesh import DeviceMesh
+        from torch.distributed.tensor.placement_types import Shard
+
+        symm_mem.set_backend("NCCL")
+        torch.cuda.set_device(self.rank)
+        c10d.all_reduce(torch.ones(1, device=self.device))
+        group_name = c10d.group.WORLD.group_name
+
+        world_size = self.world_size
+        # Split WORLD in half into src/dst meshes.  Require even world_size.
+        self.assertEqual(
+            world_size % 2,
+            0,
+            msg="test_mxn_cast_2d_disjoint_meshes requires even world_size",
+        )
+        src_size = world_size // 2
+        dst_size = world_size - src_size
+        src_ranks = list(range(src_size))
+        dst_ranks = list(range(src_size, world_size))
+        is_src = self.rank in src_ranks
+        is_dst = self.rank in dst_ranks
+
+        # Pick dims divisible by both src_size and dst_size (they're equal
+        # in this test, but the extra factor keeps the test robust to
+        # unequal splits).
+        global_rows = 8 * src_size * dst_size
+        global_cols = 4 * src_size * dst_size
+        dtype = torch.float
+
+        global_tensor = (
+            torch.arange(global_rows * global_cols, dtype=dtype, device=self.device)
+            .reshape(global_rows, global_cols)
+        )
+
+        # Helper function to extract a local shard of a global tensor.
+        def local_shard(
+            t: torch.Tensor, shard_dim: int, shard_idx: int, mesh_size: int
+        ) -> torch.Tensor:
+            if shard_dim == 0:
+                block = global_rows // mesh_size
+                return t[shard_idx * block : (shard_idx + 1) * block, :].contiguous()
+            else:
+                block = global_cols // mesh_size
+                return t[:, shard_idx * block : (shard_idx + 1) * block].contiguous()
+
+        # Local shapes under each role.  The source-only and dest-only
+        # ranks pass their own side's real shape; the Python wrapper zeroes
+        # out the side they don't participate in before calling the op.
+        src_local_shape = list(
+            local_shard(global_tensor, src_shard_dim, 0, src_size).shape
+        )
+        dst_local_shape = list(
+            local_shard(global_tensor, dst_shard_dim, 0, dst_size).shape
+        )
+
+        src_local = None
+        expected_dst = None
+        if is_src:
+            src_shard_idx = src_ranks.index(self.rank)
+            src_local = local_shard(
+                global_tensor, src_shard_dim, src_shard_idx, src_size
+            )
+        if is_dst:
+            dst_shard_idx = dst_ranks.index(self.rank)
+            expected_dst = local_shard(
+                global_tensor, dst_shard_dim, dst_shard_idx, dst_size
+            )
+
+        # Size the symm-mem buffer to whichever role this rank has.
+        role_numel = 0
+        if is_src:
+            role_numel = max(role_numel, src_local.numel())
+        if is_dst:
+            role_numel = max(role_numel, expected_dst.numel())
+        buf = symm_mem.empty(role_numel, dtype=dtype, device=self.device)
+        buf.fill_(-1.0)  # sentinel so unwritten dst is detectable
+        if is_src:
+            buf[: src_local.numel()].copy_(src_local.reshape(-1))
+        symm_mem.rendezvous(buf, group=group_name)
+
+        # Use _init_backend=False so ranks not in each mesh can still
+        # construct a DeviceMesh object without participating in a
+        # subgroup-creation collective that they can't otherwise join.
+        src_mesh = DeviceMesh("cuda", src_ranks, _init_backend=False)
+        dst_mesh = DeviceMesh("cuda", dst_ranks, _init_backend=False)
+
+        symm_mem.mxn_cast(
+            buf,
+            src_local_shape=src_local_shape,
+            src_mesh=src_mesh,
+            src_placements=[Shard(src_shard_dim)],
+            dst_local_shape=dst_local_shape,
+            dst_mesh=dst_mesh,
+            dst_placements=[Shard(dst_shard_dim)],
+            group=group_name,
+        )
+
+        # c10d.barrier()
+        # torch.cuda.synchronize()
+
+        if is_src:
+            # Source-only ranks must see their original src shard unchanged.
+            src_view = buf[: src_local.numel()].view(src_local.shape)
+            self.assertEqual(
+                src_view,
+                src_local,
+                msg=(
+                    f"rank {self.rank} (src): buf was modified after "
+                    f"disjoint mxn_cast. buf: {src_view} expected: {src_local}"
+                ),
+            )
+        if is_dst:
+            # Destination-only ranks must now hold the correct dst shard.
+            dst_view = buf[: expected_dst.numel()].view(expected_dst.shape)
+            self.assertEqual(
+                dst_view,
+                expected_dst,
+                msg=(
+                    f"rank {self.rank} (dst): disjoint mxn_cast "
+                    f"Shard({src_shard_dim}) -> Shard({dst_shard_dim}) "
+                    f"produced wrong local shard. "
+                    f"dst: {dst_view} expected_dst: {expected_dst}"
+                ),
+            )
+
+    @skip_but_pass_in_sandcastle_if(TEST_WITH_ROCM, "Skip NCCL tests for ROCm")
+    @skip_but_pass_in_sandcastle_if(IS_WINDOWS, "NCCL doesn't support Windows")
     @requires_nccl_version((2, 29), "NCCL one-sided host API support from nccl 2.29")
     @skip_if_lt_x_gpu(2)
     def test_put_wait_signal(self):

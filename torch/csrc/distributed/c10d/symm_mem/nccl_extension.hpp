@@ -30,4 +30,25 @@ TORCH_API void nccl_reduce_scatter_offset(
     std::optional<at::IntArrayRef> offsets,
     std::optional<at::IntArrayRef> dst_ranks,
     const std::string& red_op);
+
+// In-place M-to-N cast (resharding) of a tensor between two 2-D rank meshes
+// using `ncclReshard3D` from `third_party/nccl-reshard`.  `buf` must be
+// allocated through NCCL symmetric memory and sized to hold the larger of
+// the source and destination local shapes.  On entry, the first
+// `prod(src_local_shape)` elements of `buf` contain this rank's source
+// shard; on return, the first `prod(dst_local_shape)` elements contain
+// this rank's destination shard.  Each mesh is described by
+// `(dims[2], start_rank, placement[2])` where `placement[i]` is -1 for
+// REPLICATE or a non-negative tensor dim index for SHARD.
+TORCH_API void nccl_mxn_cast(
+    at::Tensor& buf,
+    at::IntArrayRef src_local_shape,
+    at::IntArrayRef src_mesh_dims,
+    int64_t src_mesh_start_rank,
+    at::IntArrayRef src_placement,
+    at::IntArrayRef dst_local_shape,
+    at::IntArrayRef dst_mesh_dims,
+    int64_t dst_mesh_start_rank,
+    at::IntArrayRef dst_placement,
+    const std::string& group_name);
 } // namespace c10d::nccl_extension
