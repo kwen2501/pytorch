@@ -157,6 +157,7 @@ class TokenSwitch(abc.ABC):
         routing: Routing,
         expert_tokens: torch.Tensor,
         out_tokens: torch.Tensor,
+        expert_tokens_hdl: object | None = None,
     ) -> None:
         raise NotImplementedError
 
@@ -193,17 +194,171 @@ class TokenSwitch(abc.ABC):
         expert_tokens: torch.Tensor,
         *,
         out: torch.Tensor | None = None,
+        expert_tokens_hdl: object | None = None,
     ) -> torch.Tensor:
         """Gather expert outputs back to token order.
 
         With ``out=out_tokens``: writes to the provided buffer and returns it;
         no autograd support.
         Without ``out``: allocates an output buffer and returns it with autograd support.
+        ``expert_tokens_hdl``: optional ``_SymmetricMemory`` handle for
+        ``expert_tokens`` from the NCCL symm_mem backend.  When provided,
+        NCCL EP uses the associated NCCL window to P2P-read expert outputs
+        from peer ranks without staging through an internal RDMA copy buffer
+        (zero-copy combine input).  Caller must barrier the handle before
+        calling so all ranks' writes are visible via NVLink.
         """
         if out is not None:
-            self._combine(routing, expert_tokens, out)
+            self._combine(routing, expert_tokens, out, expert_tokens_hdl)
             return out
+        if expert_tokens_hdl is not None:
+            # Windowed path requires a concrete output buffer; autograd is not
+            # supported here since this path is intended for inference.
+            N = routing.topk_idx.shape[0]
+            H = expert_tokens.shape[1]
+            out_buf = expert_tokens.new_zeros(N, H)
+            self._combine(routing, expert_tokens, out_buf, expert_tokens_hdl)
+            return out_buf
         return _CombineAutograd.apply(self, routing, expert_tokens)  # type: ignore[return-value]
+
+
+class TokenSwitchNCCLExpertMajor(TokenSwitch):
+    """TokenSwitch with expert-major dispatch output.
+
+    Tokens dispatched to this rank are placed contiguous-per-expert in the output
+    buffer instead of the flat (arrival-order) layout used by :class:`TokenSwitchNCCL`.
+    The ``expert_offsets`` tensor returned by :meth:`dispatch_expert_major` is the
+    cumulative padded per-expert slot count and can be passed directly as ``offs=``
+    to :func:`torch.nn.functional.grouped_mm`.
+
+    After the grouped GEMM, the expert-major output (with topk weights pre-applied)
+    goes straight into :meth:`combine` — no re-sorting needed.
+    """
+
+    def __init__(
+        self,
+        process_group: ProcessGroup,
+        num_experts: int,
+        num_local_experts: int,
+        max_dispatch_tokens_per_rank: int,
+        max_recv_tokens_per_rank: int,
+        max_token_bytes: int,
+        alignment: int = 1,
+    ) -> None:
+        self._ep = _import_nccl_ep()
+        self._max_recv_tokens_per_rank = max_recv_tokens_per_rank
+        self._num_local_experts = num_local_experts
+        self._alignment = alignment
+        self._group = self._ep._NcclEpGroup.create(
+            process_group,
+            num_experts,
+            max_dispatch_tokens_per_rank,
+            max_recv_tokens_per_rank,
+            max_token_bytes,
+        )
+
+    def create_routing(
+        self,
+        topk_idx: torch.Tensor,
+        per_expert_token_counts: torch.Tensor | None = None,
+    ) -> Routing:
+        """Create expert routing; ``per_expert_token_counts`` is ignored (expert-major
+        uses internally-managed counters via the handle config)."""
+        handle = self._ep._NcclEpHandle.create_expert_major(
+            self._group,
+            topk_idx,
+            self._num_local_experts,
+            self._alignment,
+        )
+        return Routing(handle=handle, topk_idx=topk_idx)
+
+    def dispatch_expert_major(
+        self,
+        routing: Routing,
+        tokens: torch.Tensor,
+        topk_weights: torch.Tensor,
+        *,
+        out: tuple[torch.Tensor, torch.Tensor] | None = None,
+        out_tokens_hdl: object | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Route tokens to experts in expert-major order.
+
+        Returns ``(out_tokens, out_topk_weights, expert_offsets)`` where:
+
+        * ``out_tokens`` — shape ``[num_recv_slots, hidden]``, expert-major ordered.
+        * ``out_topk_weights`` — shape ``[num_recv_slots]``, one weight per slot.
+        * ``expert_offsets`` — shape ``[num_local_experts]`` int32, cumulative padded
+          per-expert slot counts.  Pass as ``offs=`` to
+          :func:`torch.nn.functional.grouped_mm`.
+
+        With ``out=(out_tokens, out_topk_weights)``: writes into the provided buffers
+        (no autograd support).  Without ``out``: allocates output buffers sized to
+        ``max_recv_tokens_per_rank``.
+        ``out_tokens_hdl``: optional ``_SymmetricMemory`` handle for ``out_tokens``
+        from the NCCL symm_mem backend.  When provided, NCCL EP writes dispatch
+        output directly into the symmetric buffer without staging through an internal
+        RDMA copy buffer (zero-copy dispatch output).
+        """
+        H = tokens.shape[1]
+        if out is None:
+            out_tokens = tokens.new_zeros(self._max_recv_tokens_per_rank, H)
+            out_topk_weights = torch.zeros(
+                self._max_recv_tokens_per_rank,
+                dtype=torch.float32,
+                device=tokens.device,
+            )
+        else:
+            out_tokens, out_topk_weights = out
+        if out_tokens_hdl is not None:
+            self._ep._nccl_ep_dispatch_expert_major_windowed(
+                routing.handle,
+                tokens,
+                topk_weights,
+                out_tokens,
+                out_tokens_hdl,
+                out_topk_weights,
+            )
+        else:
+            self._ep._nccl_ep_dispatch_expert_major(
+                routing.handle,
+                tokens,
+                topk_weights,
+                out_tokens,
+                out_topk_weights,
+            )
+        expert_offsets = routing.handle.get_expert_offsets()
+        return out_tokens, out_topk_weights, expert_offsets
+
+    def _dispatch(
+        self,
+        routing: Routing,
+        tokens: torch.Tensor,
+        topk_weights: torch.Tensor,
+        out_tokens: torch.Tensor,
+        out_topk_weights: torch.Tensor,
+        out_topk_idx: torch.Tensor,
+    ) -> None:
+        # Satisfies the abstract method; expert-major dispatch fills out_tokens
+        # and a 1D out_topk_weights slice but leaves out_topk_idx untouched.
+        num_recv = out_tokens.shape[0]
+        flat_weights = out_topk_weights.new_zeros(num_recv)
+        self._ep._nccl_ep_dispatch_expert_major(
+            routing.handle, tokens, topk_weights, out_tokens, flat_weights
+        )
+
+    def _combine(
+        self,
+        routing: Routing,
+        expert_tokens: torch.Tensor,
+        out_tokens: torch.Tensor,
+        expert_tokens_hdl: object | None = None,
+    ) -> None:
+        if expert_tokens_hdl is not None:
+            self._ep._nccl_ep_combine_windowed(
+                routing.handle, expert_tokens, expert_tokens_hdl, out_tokens
+            )
+        else:
+            self._ep._nccl_ep_combine(routing.handle, expert_tokens, out_tokens)
 
 
 class TokenSwitchNCCL(TokenSwitch):
@@ -263,6 +418,7 @@ class TokenSwitchNCCL(TokenSwitch):
         routing: Routing,
         expert_tokens: torch.Tensor,
         out_tokens: torch.Tensor,
+        expert_tokens_hdl: object | None = None,
     ) -> None:
         self._ep._nccl_ep_combine(
             routing.handle,

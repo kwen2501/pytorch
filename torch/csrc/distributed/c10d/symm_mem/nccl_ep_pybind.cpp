@@ -6,6 +6,7 @@
 // extension-import machinery loads libnccl_ep (and raises ImportError if the
 // optional nccl4py wheel that provides it is absent). libtorch_cuda therefore
 // never references ncclEp* and torch imports with or without nccl4py.
+#include <torch/csrc/distributed/c10d/symm_mem/SymmetricMemory.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/nccl_ep.hpp>
 #include <torch/csrc/utils/pybind.h>
 
@@ -43,7 +44,15 @@ PYBIND11_MODULE(_nccl_ep, m) {
           py::arg("group"),
           py::arg("topk_idx"),
           py::arg("recv_expert_counter") = py::none())
-      .def("get_num_recv_tokens", &nccl_ep_handle_get_num_recv_tokens);
+      .def_static(
+          "create_expert_major",
+          &nccl_ep_create_handle_expert_major,
+          py::arg("group"),
+          py::arg("topk_idx"),
+          py::arg("num_local_experts"),
+          py::arg("alignment") = 1)
+      .def("get_num_recv_tokens", &nccl_ep_handle_get_num_recv_tokens)
+      .def("get_expert_offsets", &nccl_ep_handle_get_expert_offsets);
 
   m.def(
       "_nccl_ep_dispatch",
@@ -56,9 +65,36 @@ PYBIND11_MODULE(_nccl_ep, m) {
       py::arg("out_topk_idx"));
 
   m.def(
+      "_nccl_ep_dispatch_expert_major",
+      &nccl_ep_dispatch_expert_major,
+      py::arg("handle"),
+      py::arg("tokens"),
+      py::arg("topk_weights"),
+      py::arg("out_tokens"),
+      py::arg("out_topk_weights"));
+
+  m.def(
+      "_nccl_ep_dispatch_expert_major_windowed",
+      &nccl_ep_dispatch_expert_major_windowed,
+      py::arg("handle"),
+      py::arg("tokens"),
+      py::arg("topk_weights"),
+      py::arg("out_tokens"),
+      py::arg("out_tokens_hdl"),
+      py::arg("out_topk_weights"));
+
+  m.def(
       "_nccl_ep_combine",
       &nccl_ep_combine,
       py::arg("handle"),
       py::arg("expert_tokens"),
+      py::arg("out_tokens"));
+
+  m.def(
+      "_nccl_ep_combine_windowed",
+      &nccl_ep_combine_windowed,
+      py::arg("handle"),
+      py::arg("expert_tokens"),
+      py::arg("expert_tokens_hdl"),
       py::arg("out_tokens"));
 }
